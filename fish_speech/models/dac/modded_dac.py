@@ -1,4 +1,5 @@
 import math
+import os
 import typing as tp
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -113,7 +114,8 @@ class Transformer(nn.Module):
         else:
             self.register_buffer("freqs_cis", None)
 
-        causal_mask = torch.tril(torch.ones(32768, 32768, dtype=torch.bool))
+        max_mask_len = int(os.environ.get("FISH_MAX_CODEC_MASK_LEN", 4096))
+        causal_mask = torch.tril(torch.ones(max_mask_len, max_mask_len, dtype=torch.bool))
         self.register_buffer("causal_mask", causal_mask, persistent=False)
 
         self.max_batch_size = -1
@@ -158,6 +160,18 @@ class Transformer(nn.Module):
             freqs_cis = None
 
         if mask is None:  # in case of non-causal model
+            max_idx = (
+                int(input_pos.max()) + 1 if input_pos is not None else x.size(1)
+            )
+            if self.causal_mask.size(0) < max_idx:
+                self.causal_mask = torch.tril(
+                    torch.ones(
+                        max_idx,
+                        max_idx,
+                        dtype=torch.bool,
+                        device=self.causal_mask.device,
+                    )
+                )
             if not self.training and self.use_kv_cache:
                 mask = self.causal_mask[None, None, input_pos]
                 mask = mask[..., : input_pos.max() + 1]

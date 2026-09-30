@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import math
+import os
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -285,12 +286,16 @@ class BaseTransformer(nn.Module):
             ),
             persistent=False,
         )
+        init_mask_len = min(
+            config.max_seq_len,
+            int(os.environ.get("FISH_MAX_SEQ_LEN", 4096)),
+        )
         self.register_buffer(
             "causal_mask",
             torch.tril(
                 torch.ones(
-                    config.max_seq_len,
-                    config.max_seq_len,
+                    init_mask_len,
+                    init_mask_len,
                     dtype=torch.bool,
                 )
             ),
@@ -313,6 +318,16 @@ class BaseTransformer(nn.Module):
         max_seq_len = find_multiple(max_seq_len, 8)
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
+
+        if self.causal_mask.size(0) < max_seq_len:
+            self.causal_mask = torch.tril(
+                torch.ones(
+                    max_seq_len,
+                    max_seq_len,
+                    dtype=torch.bool,
+                    device=self.causal_mask.device,
+                )
+            )
 
         for b in self.layers:
             b.attention.kv_cache = KVCache(
@@ -358,6 +373,15 @@ class BaseTransformer(nn.Module):
 
         mask = None
         if key_padding_mask is not None:
+            if self.causal_mask.size(0) < seq_len:
+                self.causal_mask = torch.tril(
+                    torch.ones(
+                        seq_len,
+                        seq_len,
+                        dtype=torch.bool,
+                        device=self.causal_mask.device,
+                    )
+                )
             causal = self.causal_mask[:seq_len, :seq_len]
             causal = rearrange(causal, "q k -> 1 1 q k")
 
@@ -525,18 +549,26 @@ class BaseTransformer(nn.Module):
         if load_weights is False:
             logger.info("Randomly initialized model")
         else:
-            if "int8" in str(Path(path)):
-                logger.info("Using int8 weight-only quantization!")
+            path_str = str(Path(path)).lower()
+            if "torchao" in path_str:
+                import torchao
+
+                logger.info("Detected TorchAO checkpoint; weights will be directly assigned.")
+            elif "int8" in path_str:
+                logger.info("Using native int8 weight-only quantization!")
                 from tools.llama.quantize import WeightOnlyInt8QuantHandler
 
                 simple_quantizer = WeightOnlyInt8QuantHandler(model)
                 model = simple_quantizer.convert_for_runtime()
 
-            if "int4" in str(Path(path)):
-                logger.info("Using int4 quantization!")
-                path_comps = path.name.split("-")
-                assert path_comps[-2].startswith("g")
-                groupsize = int(path_comps[-2][1:])
+            elif "int4" in path_str:
+                logger.info("Using native int4 quantization!")
+                path_comps = Path(path).name.split("-")
+                groupsize = 128
+                for comp in path_comps:
+                    if comp.startswith("g") and comp[1:].isdigit():
+                        groupsize = int(comp[1:])
+                        break
                 from tools.llama.quantize import WeightOnlyInt4QuantHandler
 
                 simple_quantizer = WeightOnlyInt4QuantHandler(model, groupsize)
@@ -565,11 +597,16 @@ class BaseTransformer(nn.Module):
                 weights = OrderedDict(st_load_file(str(single_st), device="cpu"))
                 weights = _remap_fish_qwen3_omni_keys(weights)
             elif pth_file.exists():
+                load_device = (
+                    torch.device("cuda:0")
+                    if ("torchao" in path_str and "int4" in path_str and torch.cuda.is_available())
+                    else "cpu"
+                )
                 weights = torch.load(
                     pth_file,
-                    map_location="cpu",
-                    mmap=True,
-                    weights_only=True,
+                    map_location=load_device,
+                    mmap=(load_device == "cpu"),
+                    weights_only=("torchao" not in path_str),
                 )
                 if "state_dict" in weights:
                     weights = weights["state_dict"]

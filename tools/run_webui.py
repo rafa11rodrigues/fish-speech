@@ -37,6 +37,8 @@ def parse_args():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--max-gradio-length", type=int, default=0)
     parser.add_argument("--theme", type=str, default="dark")
+    parser.add_argument("--server-name", type=str, default="127.0.0.1", help="Server host/IP for Gradio")
+    parser.add_argument("--server-port", type=int, default=7860, help="Server port for Gradio")
 
     return parser.parse_args()
 
@@ -104,4 +106,4 @@ if __name__ == "__main__":
     inference_fct = get_inference_wrapper(inference_engine)
 
     app = build_app(inference_fct, args.theme)
-    app.launch()
+    app.launch(server_name=args.server_name, server_port=args.server_port)

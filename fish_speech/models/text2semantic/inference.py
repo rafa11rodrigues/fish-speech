@@ -279,11 +279,15 @@ def generate(
     ).dtype  # model weight dtype (bfloat16), NOT prompt dtype (int32)
 
     # Critical fix: Only set up cache on first run or when necessary
+    cache_max_seq_len = min(
+        model.config.max_seq_len,
+        int(os.environ.get("FISH_MAX_SEQ_LEN", 4096)),
+    )
     if not hasattr(model, "_cache_setup_done") or not model._cache_setup_done:
         with torch.device(device):
             model.setup_caches(
                 max_batch_size=1,  # Fixed to 1, avoid dynamic changes
-                max_seq_len=model.config.max_seq_len,
+                max_seq_len=cache_max_seq_len,
                 dtype=next(model.parameters()).dtype,
             )
         model._cache_setup_done = True
@@ -293,7 +297,7 @@ def generate(
     # Create new tensor each time, but try to reuse memory
     input_pos = torch.arange(0, T, device=device, dtype=torch.long)
     empty = torch.empty(
-        (codebook_dim, model.config.max_seq_len), dtype=prompt.dtype, device=device
+        (codebook_dim, cache_max_seq_len), dtype=prompt.dtype, device=device
     )
     empty[:, :T] = prompt
     seq = empty
@@ -758,12 +762,18 @@ def launch_thread_safe_queue(
         model, decode_one_token = init_model(
             checkpoint_path, device, precision, compile=compile
         )
+        cache_max_seq_len = min(
+            model.config.max_seq_len,
+            int(os.environ.get("FISH_MAX_SEQ_LEN", 4096)),
+        )
+        logger.info(f"Setting up KV cache with max_seq_len={cache_max_seq_len}")
         with torch.device(device):
             model.setup_caches(
                 max_batch_size=1,
-                max_seq_len=model.config.max_seq_len,
+                max_seq_len=cache_max_seq_len,
                 dtype=next(model.parameters()).dtype,
             )
+        model._cache_setup_done = True
         init_event.set()
 
         while True:

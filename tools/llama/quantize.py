@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 import datetime
+import os
 import shutil
 
 # This source code is licensed under the license found in the
@@ -13,8 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from fish_speech.models.text2semantic.inference import load_model
-from fish_speech.models.text2semantic.llama import find_multiple
+from fish_speech.models.text2semantic.llama import DualARTransformer, find_multiple
 
 ##### Quantization Primitives ######
 
@@ -243,8 +243,9 @@ def prepare_int4_weight_and_scales_and_zeros(weight_bf16, groupsize, inner_k_til
     weight_int32, scales_and_zeros = group_quantize_tensor(
         weight_bf16, n_bit=4, groupsize=groupsize
     )
+    weight_uint8 = (weight_int32[::, ::2] << 4 | weight_int32[::, 1::2]).to(torch.uint8)
     weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(
-        weight_int32, inner_k_tiles
+        weight_uint8, inner_k_tiles
     )
     return weight_int4pack, scales_and_zeros
 
@@ -418,80 +419,92 @@ class WeightOnlyInt4Linear(torch.nn.Module):
         )
 
 
-def generate_folder_name():
-    now = datetime.datetime.now()
-    folder_name = now.strftime("%Y%m%d_%H%M%S")
-    return folder_name
+def copy_metadata_and_symlink_codec(src_dir: Path, dst_dir: Path):
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    files_to_copy = [
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "chat_template.jinja",
+    ]
+    for filename in files_to_copy:
+        src_file = src_dir / filename
+        if src_file.exists():
+            shutil.copy2(src_file, dst_dir / filename)
+
+    codec_src = src_dir / "codec.pth"
+    codec_dst = dst_dir / "codec.pth"
+    if codec_src.exists() and not codec_dst.exists():
+        rel_path = Path(os.path.relpath(codec_src, dst_dir))
+        codec_dst.symlink_to(rel_path)
 
 
 @click.command()
 @click.option(
     "--checkpoint-path",
     type=click.Path(path_type=Path, exists=True),
-    default="checkpoints/fish-speech-1.4",
+    default="checkpoints/s2-pro",
+    help="Path to source checkpoint (e.g. checkpoints/s2-pro)",
 )
 @click.option(
-    "--mode", type=str, default="int8", help="type of quantization to perform"
+    "--mode",
+    type=click.Choice(["int8", "int4"]),
+    default="int8",
+    help="Quantization mode (int8, int4)",
 )
 @click.option(
     "--groupsize", type=int, default=128, help="Group size for int4 quantization."
 )
-@click.option("--timestamp", type=str, default="None", help="When to do quantization")
-def quantize(checkpoint_path: Path, mode: str, groupsize: int, timestamp: str) -> None:
-
-    device = "cpu"
-    precision = torch.bfloat16
-
-    print("Loading model ...")
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Destination directory for quantized model.",
+)
+def quantize(
+    checkpoint_path: Path, mode: str, groupsize: int, output_dir: Path | None
+) -> None:
+    print(f"Loading DualARTransformer from {checkpoint_path} ...")
     t0 = time.time()
 
-    model, _ = load_model(
-        checkpoint_path=checkpoint_path,
-        device=device,
-        precision=precision,
-        compile=False,
+    model = DualARTransformer.from_pretrained(
+        str(checkpoint_path),
+        load_weights=True,
     )
-    vq_model = "codec.pth"
-    now = timestamp if timestamp != "None" else generate_folder_name()
+
+    if output_dir is None:
+        if mode == "int8":
+            output_dir = Path("checkpoints/s2-pro-native-int8")
+        elif mode == "int4":
+            output_dir = Path(f"checkpoints/s2-pro-native-int4-g{groupsize}")
+
+    copy_metadata_and_symlink_codec(checkpoint_path, output_dir)
+    quantize_path = output_dir / "model.pth"
 
     if mode == "int8":
         print(
-            "Quantizing model weights for int8 weight-only symmetric per-channel quantization"
+            "Quantizing model weights for int8 weight-only symmetric per-channel quantization..."
         )
         quant_handler = WeightOnlyInt8QuantHandler(model)
         quantized_state_dict = quant_handler.create_quantized_state_dict()
-
-        dir_name = checkpoint_path
-        dst_name = Path(f"checkpoints/fs-1.2-int8-{now}")
-        shutil.copytree(str(dir_name.resolve()), str(dst_name.resolve()))
-        if (dst_name / vq_model).exists():
-            (dst_name / vq_model).unlink()
-        quantize_path = dst_name / "model.pth"
-
     elif mode == "int4":
         print(
-            "Quantizing model weights for int4 weight-only affine per-channel groupwise quantization"
+            f"Quantizing model weights for int4 weight-only affine groupwise quantization (group={groupsize})..."
         )
         quant_handler = WeightOnlyInt4QuantHandler(model, groupsize)
         quantized_state_dict = quant_handler.create_quantized_state_dict()
-
-        dir_name = checkpoint_path
-        dst_name = Path(f"checkpoints/fs-1.2-int4-g{groupsize}-{now}")
-        shutil.copytree(str(dir_name.resolve()), str(dst_name.resolve()))
-        if (dst_name / vq_model).exists():
-            (dst_name / vq_model).unlink()
-        quantize_path = dst_name / "model.pth"
-
     else:
-        raise ValueError(
-            f"Invalid quantization mode {mode} needs to be one of [int8, int4, int4-gpptq]"
-        )
+        raise ValueError(f"Invalid quantization mode: {mode}")
 
-    print(f"Writing quantized weights to {quantize_path}")
-    quantize_path.unlink(missing_ok=True)  # remove existing file if one already there
+    print(f"Writing quantized weights to {quantize_path} ...")
+    quantize_path.unlink(missing_ok=True)
     torch.save(quantized_state_dict, quantize_path)
-    print(f"Quantization complete took {time.time() - t0:.02f} seconds")
+    print(
+        f"Quantization complete! Took {time.time() - t0:.02f} seconds. Saved to {output_dir}"
+    )
 
 
 if __name__ == "__main__":
     quantize()
+
