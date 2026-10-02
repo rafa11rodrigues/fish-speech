@@ -39,6 +39,11 @@ def parse_args():
     parser.add_argument("--theme", type=str, default="dark")
     parser.add_argument("--server-name", type=str, default="127.0.0.1", help="Server host/IP for Gradio")
     parser.add_argument("--server-port", type=int, default=7860, help="Server port for Gradio")
+    parser.add_argument(
+        "--offload-codec",
+        action="store_true",
+        help="Offload DAC vocoder codec to CPU to save ~1.74 GB VRAM",
+    )
 
     return parser.parse_args()
 
@@ -66,12 +71,16 @@ if __name__ == "__main__":
         compile=args.compile,
     )
 
-    logger.info("Loading VQ-GAN model...")
+    decoder_device = "cpu" if args.offload_codec else args.device
+    logger.info(f"Loading VQ-GAN model on {decoder_device}...")
     decoder_model = load_decoder_model(
         config_name=args.decoder_config_name,
         checkpoint_path=args.decoder_checkpoint_path,
-        device=args.device,
+        device=decoder_device,
     )
+    if args.offload_codec:
+        # DAC vocoder must run in float32 on CPU for proper performance
+        decoder_model = decoder_model.to(device="cpu", dtype=torch.float32)
 
     logger.info("Decoder model loaded, warming up...")
 
@@ -81,6 +90,7 @@ if __name__ == "__main__":
         decoder_model=decoder_model,
         compile=args.compile,
         precision=args.precision,
+        llama_device=args.device,
     )
 
     # Dry run to check if the model is loaded correctly and avoid the first-time latency

@@ -18,12 +18,14 @@ class ModelManager:
         llama_checkpoint_path: str,
         decoder_checkpoint_path: str,
         decoder_config_name: str,
+        offload_codec: bool = False,
     ) -> None:
 
         self.mode = mode
         self.device = device
         self.half = half
         self.compile = compile
+        self.offload_codec = offload_codec
 
         self.precision = torch.half if half else torch.bfloat16
 
@@ -39,14 +41,22 @@ class ModelManager:
         self.load_llama_model(
             llama_checkpoint_path, self.device, self.precision, self.compile, self.mode
         )
+
+        decoder_device = "cpu" if self.offload_codec else self.device
+        logger.info(f"Loading VQ-GAN model on {decoder_device}...")
         self.load_decoder_model(
-            decoder_config_name, decoder_checkpoint_path, self.device
+            decoder_config_name, decoder_checkpoint_path, decoder_device
         )
+        if self.offload_codec:
+            # DAC vocoder must run in float32 on CPU for proper performance
+            self.decoder_model = self.decoder_model.to(device="cpu", dtype=torch.float32)
+
         self.tts_inference_engine = TTSInferenceEngine(
             llama_queue=self.llama_queue,
             decoder_model=self.decoder_model,
             precision=self.precision,
             compile=self.compile,
+            llama_device=self.device,
         )
 
         # Warm up the models

@@ -139,7 +139,53 @@ Beyond weight quantization, four critical bottlenecks in the runtime code were c
 
 ---
 
-## 5. Memory Footprint & Performance Comparison
+## 5. Neural Vocoder CPU Offloading (`--offload-codec` / `-o`)
+
+To push memory reduction to the absolute limit for extreme low-VRAM environments (such as 4 GB or 6 GB GPUs), the neural vocoder / discrete audio codec (`DAC` model) can be offloaded entirely to system RAM and executed on the CPU while keeping the LLaMA autoregressive model on the GPU.
+
+### 5.1. How It Works & Architecture
+```mermaid
+flowchart LR
+    subgraph GPU ["GPU (CUDA)"]
+        LLaMA["Dual-AR LLaMA Model"] -->|"VQ Tokens (codes)"| VQBridge["Transfer to CPU"]
+    end
+    subgraph CPU ["System Host (CPU, Float32)"]
+        VQBridge --> DAC["DAC Neural Vocoder"]
+        DAC --> Audio["Raw 44.1 kHz Waveform"]
+    end
+```
+
+- When `--offload-codec` (or `-o`) is activated:
+  - The ~1.74 GB DAC model is instantiated on `cpu` in `torch.float32`.
+  - The LLaMA model remains on `cuda`.
+  - After the LLaMA worker finishes generating acoustic tokens (`codes`), the tokens are transferred to CPU memory (`codes.to(self.decoder_model.device)`).
+  - The DAC vocoder synthesizes the raw 44.1 kHz audio directly on host CPU cores.
+- **GPU VRAM Impact**: Total GPU VRAM for `native-int4` drops from **~5.31 GB to ~3.57 GB** (saving **~1.74 GB of GPU VRAM**).
+
+### 5.2. Critical Implementation Details & Gotchas
+1. **Mandatory Float32 on CPU**:
+   - The DAC vocoder uses deep convolutional networks with weight-normalized 1D convolutions (`WNConv1d`), transposed convolutions (`WNConvTranspose1d`), and non-linear `Snake1d` activations.
+   - Standard consumer x86_64 CPUs lack hardware vectorization for `bfloat16` convolutions (which require AVX-512 BF16). Benchmarking revealed that running DAC in `bfloat16` on CPU takes **>30 seconds** for 9 seconds of audio.
+   - In `torch.float32` using optimized AVX2/oneDNN kernels, the same chunk decodes in **~4.8 seconds**. Therefore, the CPU decoder is strictly forced to `torch.float32`.
+2. **Autocast Bypass**:
+   - In `fish_speech/inference_engine/__init__.py`, PyTorch `autocast` is bypassed when `decoder_model.device.type in ("mps", "cpu")` to prevent PyTorch from inadvertently downcasting CPU operations into slow half-precision routines.
+3. **Decoupled LLaMA Device**:
+   - `TTSInferenceEngine` accepts an explicit `llama_device` parameter (default: `cuda`), decoupling it from `decoder_model.device`. Without this separation, `send_Llama_request()` would attempt to create input prompt tensors on `cpu`, causing a runtime device mismatch with the CUDA LLaMA model.
+
+### 5.3. Latency vs. VRAM Trade-Off Analysis
+| Device & Precision | Time for ~9.3s Audio | Real-Time Factor (RTF) | Real-Time Speedup | VRAM Savings |
+| :--- | :---: | :---: | :---: | :---: |
+| **GPU (CUDA, BF16)** | **~390 ms** | **0.042** | **~24x real-time** | 0 GB (Baseline) |
+| **CPU (Host, Float32 AVX2)** | **~4.88 s** | **0.525** | **~1.9x real-time** | **~1.74 GB saved** |
+| **CPU (Host, BFloat16)** | > 30 s | > 3.2 | < 0.3x real-time (Stalls) | Not Recommended |
+
+> [!TIP]
+> **When to use `--offload-codec`**:
+> On GPUs with 8 GB or 16 GB VRAM (like the RTX 5070 Ti), `native-int4` with the codec on GPU only uses ~5.3 GB total VRAM, leaving over 10.5 GB of free headroom. For normal interactive synthesis, **leave codec offloading disabled** for near-instant (<400ms) audio decode. Use `-o` primarily on 4 GB–6 GB cards or when packing multiple AI models concurrently onto the same GPU.
+
+---
+
+## 6. Memory Footprint & Performance Comparison
 
 All benchmarks measured on NVIDIA GeForce RTX 5070 Ti (16 GB VRAM, Driver 591.86, CUDA 13.1, Ubuntu WSL2):
 
@@ -151,20 +197,24 @@ All benchmarks measured on NVIDIA GeForce RTX 5070 Ti (16 GB VRAM, Driver 591.86
 | **Native Weight-Only INT8** | INT8 | ~4.77 GB | ~7.35 GB | ~12.6 tok/s | ~8.9 GB |
 | **TorchAO Groupwise INT4** | INT4 g128 | ~3.26 GB | ~5.85 GB | ~12.0 tok/s | ~10.4 GB |
 | **Native Groupwise INT4** *(Default)* | INT4 g128 | **~3.20 GB** | **~5.31 GB** | ~12.8 tok/s | **~10.9 GB** |
+| **Native INT4 + CPU Codec (`-o`)** | INT4 g128 | **~3.20 GB** | **~3.57 GB** | ~12.8 tok/s *(+4.8s decode)* | **~12.7 GB** |
 
-*(Note: Total Runtime VRAM includes the DualAR model, the 4096-token KV-cache, the DAC neural vocoder model, and PyTorch CUDA context overhead).*
+*(Note: Total Runtime VRAM includes the DualAR model, the 4096-token KV-cache, the DAC neural vocoder model [unless offloaded with `-o`], and PyTorch CUDA context overhead).*
 
 ---
 
-## 6. Execution Scripts & How to Run
+## 7. Execution Scripts & How to Run
 
 Unified shell scripts manage environment variables, paths, and arguments automatically.
 
-### 6.1. Running the WebUI (`run_webui.sh`)
+### 7.1. Running the WebUI (`run_webui.sh`)
 
 ```bash
-# Recommended default (PyTorch Native INT4, ~5.3 GB VRAM):
+# Recommended default (PyTorch Native INT4 on GPU, ~5.3 GB VRAM):
 ./run_webui.sh
+
+# Low-VRAM mode (Offload DAC vocoder to CPU, ~3.57 GB VRAM):
+./run_webui.sh -o
 
 # High-speed compiled FP8 (~45-50 tokens/sec, ~7.9 GB VRAM):
 ./run_webui.sh fp8 --compile
@@ -176,13 +226,16 @@ Unified shell scripts manage environment variables, paths, and arguments automat
 ./run_webui.sh native-int4 --host 0.0.0.0 -p 7860
 ```
 
-### 6.2. Running the API Server (`run_server.sh`)
+### 7.2. Running the API Server (`run_server.sh`)
 
 The API server uses the exact same backend engine and optimizations as the WebUI, exposing an HTTP API with chunked audio streaming support.
 
 ```bash
 # Default API server launch (Native INT4 on port 8080):
 ./run_server.sh
+
+# API server with CPU codec offload (saves ~1.74 GB VRAM):
+./run_server.sh -o
 
 # Compiled FP8 API server:
 ./run_server.sh fp8 --compile
@@ -195,7 +248,7 @@ The API server uses the exact same backend engine and optimizations as the WebUI
 
 ---
 
-## 7. How to Generate New Quantized Checkpoints
+## 8. How to Generate New Quantized Checkpoints
 
 If you update or fine-tune checkpoint weights, you can regenerate quantized versions with:
 
@@ -218,3 +271,4 @@ If you update or fine-tune checkpoint weights, you can regenerate quantized vers
     --output-path checkpoints/s2-pro-torchao-int4 \
     --mode int4 --group-size 128
 ```
+

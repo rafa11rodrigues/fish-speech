@@ -4,6 +4,7 @@ set -e
 # Default configuration
 QUANT="${QUANT:-native-int4}"
 COMPILE=false
+OFFLOAD_CODEC=false
 SERVER_NAME="127.0.0.1"
 SERVER_PORT=8080
 LISTEN=""
@@ -29,6 +30,7 @@ show_help() {
     echo ""
     echo "Options:"
     echo "  -q, --quant <variant>       Specify quantization variant"
+    echo "  -o, --offload-codec         Offload DAC vocoder to CPU (saves ~1.74 GB VRAM)"
     echo "  -c, --compile               Enable torch.compile for faster generation"
     echo "      --no-compile            Disable torch.compile (default)"
     echo "  -l, --max-seq-len <num>     Max KV-cache / context tokens (default: 4096 ≈ 3.2 min)"
@@ -44,6 +46,7 @@ show_help() {
     echo ""
     echo "Examples:"
     echo "  ./run_server.sh                               # Launch default (native-int4, 4096 ctx)"
+    echo "  ./run_server.sh -o                            # Launch with DAC vocoder on CPU (~1.5 GB VRAM)"
     echo "  ./run_server.sh native-int4 -l 2048           # Launch with smaller 2048 ctx (saves VRAM)"
     echo "  ./run_server.sh fp8 --compile                 # Launch compiled FP8"
     echo "  ./run_server.sh fp8 --host 0.0.0.0 -p 8080    # Listen on all network interfaces"
@@ -69,6 +72,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-compile)
             COMPILE=false
+            shift
+            ;;
+        -o|--offload-codec)
+            OFFLOAD_CODEC=true
             shift
             ;;
         --server-name|--host)
@@ -175,6 +182,10 @@ if [ "$COMPILE" = true ]; then
     CMD+=(--compile)
 fi
 
+if [ "$OFFLOAD_CODEC" = true ]; then
+    CMD+=(--offload-codec)
+fi
+
 if [ -n "$API_KEY" ]; then
     CMD+=(--api-key "$API_KEY")
 fi
@@ -188,15 +199,16 @@ export FISH_MAX_CODEC_MASK_LEN="$MAX_SEQ_LEN"
 
 echo "============================================================"
 echo " Starting Fish Speech API Server"
-echo " Checkpoint:  $CHECKPOINT ($QUANT)"
-echo " Decoder:     $DECODER_PATH"
-echo " Context:     $MAX_SEQ_LEN tokens (~$((MAX_SEQ_LEN / 21))s max single-pass audio)"
-echo " Listen:      http://$LISTEN"
-echo " API Docs:    http://$LISTEN/docs"
-echo " Workers:     $WORKERS"
-echo " Compile:     $COMPILE"
-[ -n "$API_KEY" ] && echo " Auth:        Bearer token configured"
-echo " Command:     ${CMD[*]}"
+echo " Checkpoint:     $CHECKPOINT ($QUANT)"
+echo " Decoder:        $DECODER_PATH"
+echo " Offload Codec:  $OFFLOAD_CODEC"
+echo " Context:        $MAX_SEQ_LEN tokens (~$((MAX_SEQ_LEN / 21))s max single-pass audio)"
+echo " Listen:         http://$LISTEN"
+echo " API Docs:       http://$LISTEN/docs"
+echo " Workers:        $WORKERS"
+echo " Compile:        $COMPILE"
+[ -n "$API_KEY" ] && echo " Auth:           Bearer token configured"
+echo " Command:        ${CMD[*]}"
 echo "============================================================"
 
 exec "${CMD[@]}"

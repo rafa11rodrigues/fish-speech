@@ -27,6 +27,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         decoder_model: DAC,
         precision: torch.dtype,
         compile: bool,
+        llama_device: str | torch.device = None,
     ) -> None:
 
         super().__init__()
@@ -35,6 +36,9 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         self.decoder_model = decoder_model
         self.precision = precision
         self.compile = compile
+        self.llama_device = llama_device or (
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
 
     @torch.inference_mode()
     def inference(self, req: ServeTTSRequest) -> Generator[InferenceResult, None, None]:
@@ -150,7 +154,7 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
 
         # Prepare the request
         request = dict(
-            device=self.decoder_model.device,
+            device=self.llama_device,
             max_new_tokens=req.max_new_tokens,
             text=req.text,
             top_p=req.top_p,
@@ -181,12 +185,15 @@ class TTSInferenceEngine(ReferenceLoader, VQManager):
         Decode the VQ tokens to audio.
         """
 
-        # Don't use autocast on MPS devices
-        with autocast_exclude_mps(
-            device_type=self.decoder_model.device.type, dtype=self.precision
-        ):
-            # Decode the symbolic tokens to audio
+        # Don't use autocast on MPS or CPU devices (DAC runs in float32 on CPU)
+        if self.decoder_model.device.type in ("mps", "cpu"):
             segment = self.decode_vq_tokens(codes=result.codes)
+        else:
+            with autocast_exclude_mps(
+                device_type=self.decoder_model.device.type, dtype=self.precision
+            ):
+                # Decode the symbolic tokens to audio
+                segment = self.decode_vq_tokens(codes=result.codes)
 
         # Convert the audio to numpy
         return segment.float().cpu().numpy()
