@@ -10,6 +10,7 @@ from kui.asgi import (
     HttpRoute,
     Kui,
     OpenAPI,
+    RedirectResponse,
     Routes,
 )
 from kui.cors import CORSConfig
@@ -49,7 +50,7 @@ class API(ExceptionHandler):
             http_middlewares=[api_auth],  # apply api_auth middleware
         )
 
-        # OpenAPIの設定
+        # OpenAPI configuration: Kuí serves Swagger UI at "/" and schema at "/json"
         self.openapi = OpenAPI(
             Info(
                 {
@@ -59,9 +60,17 @@ class API(ExceptionHandler):
             ),
         ).routes
 
+        async def redirect_to_docs():
+            return RedirectResponse("/")
+
+        docs_alias = Routes(
+            HttpRoute("/docs", redirect_to_docs, name="docs_redirect"),
+            HttpRoute("/docs/", redirect_to_docs, name="docs_slash_redirect"),
+        )
+
         # Initialize the app
         self.app = Kui(
-            routes=self.routes + self.openapi[1:],  # Remove the default route
+            routes=self.routes + self.openapi[1:] + docs_alias,
             exception_handlers={
                 HTTPException: self.http_exception_handler,
                 Exception: self.other_exception_handler,
