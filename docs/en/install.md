@@ -19,10 +19,11 @@ conda create -n fish-speech python=3.12
 conda activate fish-speech
 
 # GPU installation (choose your CUDA version: cu126, cu128, cu129)
-pip install -e .[cu129]
+# Replace both "cu129" values when using cu126 or cu128.
+pip install --extra-index-url https://download.pytorch.org/whl/cu129 -e ".[cu129]"
 
 # CPU-only installation
-pip install -e .[cpu]
+pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[cpu]"
 
 # Default installation (uses PyTorch default index)
 pip install -e .
@@ -113,6 +114,8 @@ COMPILE=1                 # Enable compile optimization
 GRADIO_PORT=7860         # WebUI port
 API_PORT=8080            # API server port
 UV_VERSION=0.8.15        # UV package manager version
+CUDA_VER=12.9.0          # CUDA base image version (e.g. 12.6.0 for older drivers)
+UV_EXTRA=cu129           # PyTorch CUDA variant (cu126, cu128, cu129) — must match CUDA_VER
 ```
 
 The command will build the image and run the container. You can access the WebUI at `http://localhost:7860` and the API server at `http://localhost:8080`.
@@ -127,8 +130,8 @@ docker build \
     --platform linux/amd64 \
     -f docker/Dockerfile \
     --build-arg BACKEND=cuda \
-    --build-arg CUDA_VER=12.6.0 \
-    --build-arg UV_EXTRA=cu126 \
+    --build-arg CUDA_VER=12.9.0 \
+    --build-arg UV_EXTRA=cu129 \
     --target webui \
     -t fish-speech-webui:cuda .
 
@@ -137,8 +140,8 @@ docker build \
     --platform linux/amd64 \
     -f docker/Dockerfile \
     --build-arg BACKEND=cuda \
-    --build-arg CUDA_VER=12.6.0 \
-    --build-arg UV_EXTRA=cu126 \
+    --build-arg CUDA_VER=12.9.0 \
+    --build-arg UV_EXTRA=cu129 \
     --target server \
     -t fish-speech-server:cuda .
 
@@ -187,3 +190,40 @@ Both methods require mounting these directories:
 
 !!! warning
     GPU support requires NVIDIA Docker runtime. For CPU-only deployment, remove the `--gpus all` flag and use CPU images.
+
+### AMD ROCm support
+
+Fish Speech runs on AMD GPUs via ROCm. The ROCm image is based on the official `rocm/pytorch` image, which already ships a gfx-tuned PyTorch, so no separate torch install is needed. Verified on RDNA4 (Radeon AI PRO R9700 / gfx1201) with ROCm 7.2.3; RDNA3 (gfx1100/gfx1101) should also work.
+
+**Prerequisites:**
+
+- AMD GPU with ROCm support (RDNA3 / RDNA4)
+- ROCm drivers installed on the host
+- Docker with GPU passthrough (`/dev/kfd` and `/dev/dri`)
+
+**Using Docker Compose:**
+
+```bash
+# WebUI
+docker compose -f compose.rocm.yml --profile webui up --build
+
+# API server
+docker compose -f compose.rocm.yml --profile server up --build
+```
+
+**Manual build and run:**
+
+```bash
+docker build -f docker/Dockerfile.rocm --target webui -t fish-speech-webui:rocm .
+
+docker run \
+    --device=/dev/kfd --device=/dev/dri \
+    --group-add video --group-add render \
+    -e ROCBLAS_USE_HIPBLASLT=0 \
+    -v ./checkpoints:/app/checkpoints \
+    -p 7860:7860 \
+    fish-speech-webui:rocm
+```
+
+!!! note
+    `ROCBLAS_USE_HIPBLASLT=0` is set by default for RDNA4 (gfx1201) stability; RDNA3 users may not need it. Fish Speech uses `scaled_dot_product_attention`, which dispatches to ROCm's AOTriton flash-attention backend automatically — no custom kernel build is required. The first run is slower while MIOpen auto-tunes kernels. `torch.compile` is enabled by default (`COMPILE=1`); set `COMPILE=0` to disable.
